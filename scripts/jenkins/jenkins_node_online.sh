@@ -30,8 +30,10 @@ curl_auth() {
     printf 'user = "%s:%s"\n' "${u//\"/\\\"}" "${t//\"/\\\"}" | curl -K - "$@"
 }
 
+# Readable prefix plus a checksum of the exact name, so two different names
+# ("a/b" and "a_b") never share a state file.
 sanitize_state_name() {
-    printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'
+    printf '%s.%s' "$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')" "$(printf '%s' "$1" | cksum | cut -d' ' -f1)"
 }
 
 register_state_file() {
@@ -76,6 +78,14 @@ post_url() {
         "${url}" >/dev/null
 }
 
+# node_path NAME: the node name URL-encoded for /computer/<name>/.
+node_path() {
+    "${PYTHON_BIN}" -c '
+import os, sys, urllib.parse
+print(urllib.parse.quote(os.fsencode(sys.argv[1]), safe=""))
+' "$1"
+}
+
 state_value() {
     local state_file=$1
     local name=$2
@@ -85,7 +95,7 @@ state_value() {
 
 node_status() {
     local node_name=$1
-    local node_api="${JENKINS_BASE_URL}/computer/${node_name}/api/json"
+    local node_api="${JENKINS_BASE_URL}/computer/$(node_path "${node_name}")/api/json"
 
     fetch_url "${node_api}" | "${PYTHON_BIN}" -c '
 import json, sys
@@ -107,7 +117,7 @@ print(data["crumb"])
 
 bring_node_online() {
     local node_name=$1
-    local node_api="${JENKINS_BASE_URL}/computer/${node_name}/api/json"
+    local node_api="${JENKINS_BASE_URL}/computer/$(node_path "${node_name}")/api/json"
     local status
     local offline
     local temporarily_offline
@@ -159,7 +169,7 @@ bring_node_online() {
     # failed reply can follow an applied toggle), so the node status decides.
     # Another toggle is sent only while the node is still marked offline.
     for attempt in 1 2 3; do
-        post_url "${JENKINS_BASE_URL}/computer/${node_name}/toggleOffline" "${crumb_field}" "${crumb_value}" ||
+        post_url "${JENKINS_BASE_URL}/computer/$(node_path "${node_name}")/toggleOffline" "${crumb_field}" "${crumb_value}" ||
             echo "toggle request for ${node_name} reported an error (attempt ${attempt}/3); checking the node" >&2
 
         if ! status=$(node_status "${node_name}"); then

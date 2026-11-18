@@ -13,8 +13,10 @@ INTERVAL=${4:-}
 TIMEOUT=${5:-}
 STATE_DIR=${JENKINS_WAIT_STATE_DIR:-/tmp/jenkins_wait_build.d}
 
+# Readable prefix plus a checksum of the exact name, so two different names
+# ("a/b" and "a_b") never share a state file.
 sanitize_state_name() {
-    printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'
+    printf '%s.%s' "$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')" "$(printf '%s' "$1" | cksum | cut -d' ' -f1)"
 }
 
 mkdir -p "${STATE_DIR}"

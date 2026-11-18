@@ -45,8 +45,10 @@ print("".join("/job/" + urllib.parse.quote(os.fsencode(p), safe="") for p in sys
 ' "$1"
 }
 
+# Readable prefix plus a checksum of the exact name, so two different names
+# ("a/b" and "a_b") never share a state file.
 sanitize_state_name() {
-    printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'
+    printf '%s.%s' "$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')" "$(printf '%s' "$1" | cksum | cut -d' ' -f1)"
 }
 
 register_state_file() {
@@ -289,6 +291,14 @@ monitor_state_dir() {
 if [[ $# -eq 0 ]]; then
     monitor_state_dir
 else
+    # Check the timings before anything is written, so a usage error leaves no
+    # pending entry behind.
+    for v in "${@:3}"; do
+        if [[ ! ${v} =~ ^[0-9]+$ ]]; then
+            echo "initial-wait, interval and timeout must be whole seconds: ${v}" >&2
+            exit 64
+        fi
+    done
     register_state_file "$@"
     monitor_single_build "$@"
 fi
