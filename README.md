@@ -290,9 +290,15 @@ Claude Code 는 `CLAUDE.md` 의 `@AGENTS.md` 로, Codex 는 `AGENTS.md` 를 직�
 | 대상 | 방법 |
 |---|---|
 | Node.js | 프로필의 `NODE_MAJOR` |
-| Claude Code, Codex | 프로필의 `CLAUDE_CODE_VERSION`, `CODEX_VERSION` (CLI 가 없어서 새로 설치할 때 적용) |
+| Claude Code, Codex | 프로필의 `CLAUDE_CODE_VERSION`, `CODEX_VERSION` |
 | git 으로 설치하는 MCP | 카탈로그 항목의 `install.ref` (태그 또는 커밋) |
 | npx / npm 으로 설치하는 MCP | 카탈로그 항목의 패키지 이름을 `@scope/name@1.2.3` 으로 (`npx` 는 `args` 에도 같은 이름) |
+
+`CLAUDE_CODE_VERSION`, `CODEX_VERSION` 에 `2.1.300` 같은 정확한 버전을 적으면, CLI 가 없을 때는 그
+버전을 설치하고 이미 있는데 버전이 다르면 그 버전으로 다시 설치합니다. 같은 프로필로 다시 실행하면
+버전이 이미 맞으므로 아무것도 하지 않습니다. 비워 두면 없을 때만 최신을 설치하고 설치된 CLI 는 건드리지
+않습니다. `latest` 같은 태그는 비교할 수 없어서 새로 설치할 때만 쓰입니다. 설치는 npm 전역으로 하므로,
+같은 CLI 가 다른 방식으로도 설치돼 있어 PATH 에서 앞서면 버전이 바뀌지 않고 경고가 나옵니다.
 
 NodeSource 설치 스크립트 자체와 플러그인 마켓플레이스는 고정하지 않습니다.
 
@@ -359,6 +365,9 @@ Jenkins 헬퍼처럼 이 파일을 셸에서 불러 쓰는 경우에는 `export`
 
 ## 알아둘 점
 
+- 카탈로그의 `build` 명령은 설치 중에 셸에서 그대로 실행됩니다. `npm`·`npx` 로 설치하는 MCP 도 패키지의
+  설치 스크립트를 실행합니다. 킷과 함께 온 `mcp/catalog.json` 이나 직접 작성한 카탈로그처럼 신뢰할 수
+  있는 것만 쓰고, 받은 카탈로그는 `build`, `repo`, `package` 를 읽어 본 뒤에 쓰세요.
 - `claude` / `codex` 로그인은 설치 후 직접 해야 합니다.
 - Codex 에 MCP 를 등록할 때는 CLI 특성상 토큰이 잠깐 프로세스 인자로 전달됩니다. Claude 는 stdin 으로
   넘기지만, 에이전트 세션 안에서 설치를 돌리면 같은 방식으로 대체됩니다.
