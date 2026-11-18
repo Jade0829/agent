@@ -40,6 +40,12 @@ node_ok() {
 install_node() {
     step "Node.js"
     if node_ok; then ok "node $(node --version)"; return; fi
+    # The value becomes part of the NodeSource script URL (setup_<value>.x).
+    NODE_MAJOR=${NODE_MAJOR:-22}
+    case $NODE_MAJOR in
+        lts | current | [0-9] | [0-9][0-9]) ;;
+        *) die "NODE_MAJOR 값이 올바르지 않습니다: '$NODE_MAJOR' (예: 22, lts)" ;;
+    esac
     local setup
     setup=$(mktemp)
     case $PM in
@@ -76,16 +82,43 @@ npm_global() {
     run npm install -g --no-fund --no-audit "$@"
 }
 
+# cli_version CMD: the x.y.z part of 'CMD --version' (empty if unknown).
+cli_version() {
+    "$1" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.+-]*' | head -1 || true
+}
+
+# ensure_cli LABEL CMD PACKAGE PIN
+# Missing: install (PIN if given, else latest). Present and PIN is an exact
+# version: converge to it, so a rerun with the same profile changes nothing.
+# Present and no PIN (or a tag such as "latest"): left as it is.
+ensure_cli() {
+    local label=$1 cmd=$2 pkg=$3 pin=$4 cur
+    if ! have "$cmd"; then
+        info "$label 설치"
+        npm_global "$pkg${pin:+@$pin}"
+        return 0
+    fi
+    cur=$(cli_version "$cmd")
+    case $pin in
+        [0-9]*)
+            if [ "$cur" != "$pin" ]; then
+                info "$label ${cur:-?} → $pin (프로필에서 고정한 버전)"
+                npm_global "$pkg@$pin"
+                hash -r
+                if [ "$DRY_RUN" -eq 0 ] && [ "$(cli_version "$cmd")" != "$pin" ]; then
+                    warn "$label: $pin 을 설치했지만 '$cmd' 는 $(cli_version "$cmd") 입니다 — 다른 경로의 설치가 PATH 에서 우선합니다 ($(command -v "$cmd"))"
+                fi
+                return 0
+            fi
+            ;;
+    esac
+    ok "$cmd $("$cmd" --version 2>/dev/null | head -1)"
+}
+
 install_clis() {
     step "에이전트 CLI"
-    if has_tool claude; then
-        if have claude; then ok "claude $(claude --version 2>/dev/null | head -1)"
-        else info "Claude Code 설치"; npm_global "@anthropic-ai/claude-code${CLAUDE_CODE_VERSION:+@$CLAUDE_CODE_VERSION}"; fi
-    fi
-    if has_tool codex; then
-        if have codex; then ok "codex $(codex --version 2>/dev/null | head -1)"
-        else info "Codex CLI 설치"; npm_global "@openai/codex${CODEX_VERSION:+@$CODEX_VERSION}"; fi
-    fi
+    if has_tool claude; then ensure_cli "Claude Code" claude @anthropic-ai/claude-code "${CLAUDE_CODE_VERSION:-}"; fi
+    if has_tool codex; then ensure_cli "Codex CLI" codex @openai/codex "${CODEX_VERSION:-}"; fi
 }
 
 install_mcp_servers() {
@@ -105,7 +138,11 @@ install_mcp_servers() {
                 pkg=$(jq -r --arg n "$name" '.[$n].install.package' "$CATALOG")
                 scope=$(jq -r --arg n "$name" '.[$n].install.scope // ""' "$CATALOG")
                 registry=$(jq -r --arg n "$name" '.[$n].install.registry // ""' "$CATALOG")
-                [ -n "$scope" ] && [ -n "$registry" ] && run npm config set "$scope:registry" "$registry"
+                if [ -n "$scope" ] && [ -n "$registry" ] &&
+                    [ "$(npm config get "$scope:registry" 2>/dev/null)" != "$registry" ]; then
+                    backup_once "$HOME/.npmrc"
+                    run npm config set "$scope:registry" "$registry"
+                fi
                 if npm_global "$pkg" >/dev/null; then ok "$name (npm -g $pkg)"
                 else warn "$name: $pkg 설치 실패"; fi
                 ;;

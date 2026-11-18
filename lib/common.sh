@@ -95,11 +95,15 @@ upsert_block() {
     local begin="<!-- agent-kit:begin $id -->" end="<!-- agent-kit:end $id -->"
     [ -r "$src" ] || { warn "$file: 블록 내용 파일을 읽을 수 없어 건드리지 않았습니다"; return 1; }
     if [ -f "$file" ]; then
-        read -r nb ne lb le < <(awk -v b="$begin" -v e="$end" '
+        # No counts (awk failed) means the markers are unverified: do not go on.
+        if ! read -r nb ne lb le < <(awk -v b="$begin" -v e="$end" '
             { l = $0; sub(/[[:space:]]+$/, "", l) }
             l == b { nb++; lb = NR }
             l == e { ne++; le = NR }
-            END { print nb + 0, ne + 0, lb + 0, le + 0 }' "$file")
+            END { print nb + 0, ne + 0, lb + 0, le + 0 }' "$file"); then
+            warn "$file: 블록 마커를 확인하지 못해 건드리지 않았습니다"
+            return 1
+        fi
         if [ "$nb" -ne "$ne" ] || [ "$nb" -gt 1 ] || [ "$lb" -gt "$le" ]; then
             warn "$file: agent-kit '$id' 블록 마커가 짝이 맞지 않아 건드리지 않았습니다 (begin $nb / end $ne)"
             return 1

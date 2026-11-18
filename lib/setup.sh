@@ -90,9 +90,13 @@ register_mcp_servers() {
                     claude mcp remove -s user "$name" >/dev/null 2>&1 || true
                     if err=$(claude_mcp_add "$name" "$cjson") && [ -n "$(claude_mcp_current "$name")" ]; then ok "claude: $name"
                     else
-                        if [ -n "$old" ] && claude_mcp_add "$name" "$old" >/dev/null; then
+                        if [ -z "$old" ]; then
+                            warn "claude: $name 등록 실패 — $(redact "$spec" "${err##*$'\n'}")"
+                        elif claude_mcp_add "$name" "$old" >/dev/null && [ -n "$(claude_mcp_current "$name")" ]; then
                             warn "claude: $name 등록 실패, 이전 등록을 복원했습니다 — $(redact "$spec" "${err##*$'\n'}")"
-                        else warn "claude: $name 등록 실패 — $(redact "$spec" "${err##*$'\n'}")"; fi
+                        else
+                            warn "claude: $name 등록 실패, 이전 등록도 복원하지 못했습니다. 지금 claude 에는 $name 이 등록돼 있지 않습니다 — $(redact "$spec" "${err##*$'\n'}")"
+                        fi
                     fi
                 fi
             fi
