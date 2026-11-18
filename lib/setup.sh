@@ -44,6 +44,29 @@ mcp_spec() {
         .[$n] | {command, args: (.args // []), env: (.env // {})} | subst' "$CATALOG"
 }
 
+# The user-scope definition Claude Code currently holds for NAME (empty if none).
+claude_mcp_current() {
+    local cfg="$HOME/.claude.json"
+    [ -n "${CLAUDE_CONFIG_DIR:-}" ] && cfg="$CLAUDE_CONFIG_DIR/.claude.json"
+    jq -cS --arg n "$1" '.mcpServers[$n] // empty' "$cfg" 2>/dev/null || true
+}
+
+claude_mcp_add() {
+    # JSON goes through stdin so tokens never appear in the process list.
+    # (stdin is refused when run from inside an agent session — fall back to argv.)
+    printf '%s' "$2" | claude mcp add-json -s user "$1" - >/dev/null 2>&1 ||
+        claude mcp add-json -s user "$1" "$2" 2>&1
+}
+
+# redact SPEC TEXT: TEXT with every env value of SPEC masked, for safe logging.
+redact() {
+    local text=$2 v
+    while IFS= read -r v; do
+        [ ${#v} -ge 6 ] && text=${text//"$v"/***}
+    done < <(jq -r '.env[]' <<<"$1")
+    printf '%s' "$text"
+}
+
 register_mcp_servers() {
     step "MCP 서버 등록"
     local name missing spec cmd args envflags kv err
@@ -57,14 +80,21 @@ register_mcp_servers() {
         if has_tool claude && have claude; then
             if [ "$DRY_RUN" -eq 1 ]; then info "[dry-run] claude mcp add-json -s user $name"
             else
-                claude mcp remove -s user "$name" >/dev/null 2>&1 || true
-                # JSON goes through stdin so tokens never appear in the process list.
-                # (stdin is refused when run from inside an agent session — fall back to argv.)
-                local cjson err
-                cjson=$(jq -c '. + {type: "stdio"}' <<<"$spec")
-                if printf '%s' "$cjson" | claude mcp add-json -s user "$name" - >/dev/null 2>&1; then ok "claude: $name"
-                elif err=$(claude mcp add-json -s user "$name" "$cjson" 2>&1); then ok "claude: $name"
-                else warn "claude: $name 등록 실패 — ${err##*$'\n'}"; fi
+                # 'add-json' refuses to overwrite, so the old entry has to go first.
+                # Keep it, and put it back if the new one is rejected.
+                local cjson old
+                cjson=$(jq -cS '. + {type: "stdio"}' <<<"$spec")
+                old=$(claude_mcp_current "$name")
+                if [ "$old" = "$cjson" ]; then ok "claude: $name (변경 없음)"
+                else
+                    claude mcp remove -s user "$name" >/dev/null 2>&1 || true
+                    if err=$(claude_mcp_add "$name" "$cjson") && [ -n "$(claude_mcp_current "$name")" ]; then ok "claude: $name"
+                    else
+                        if [ -n "$old" ] && claude_mcp_add "$name" "$old" >/dev/null; then
+                            warn "claude: $name 등록 실패, 이전 등록을 복원했습니다 — $(redact "$spec" "${err##*$'\n'}")"
+                        else warn "claude: $name 등록 실패 — $(redact "$spec" "${err##*$'\n'}")"; fi
+                    fi
+                fi
             fi
         fi
         if has_tool codex && have codex; then
@@ -75,9 +105,9 @@ register_mcp_servers() {
                 < <(jq -r '.env | to_entries[] | "\(.key)=\(.value)"' <<<"$spec")
             if [ "$DRY_RUN" -eq 1 ]; then info "[dry-run] codex mcp add $name"
             else
-                codex mcp remove "$name" >/dev/null 2>&1 || true
+                # 'codex mcp add' replaces an existing entry itself, so nothing is removed first.
                 if err=$(codex mcp add "$name" "${envflags[@]}" -- "$cmd" "${args[@]}" 2>&1); then ok "codex: $name"
-                else warn "codex: $name 등록 실패 — ${err##*$'\n'}"; fi
+                else warn "codex: $name 등록 실패 (기존 등록은 그대로) — $(redact "$spec" "${err##*$'\n'}")"; fi
             fi
         fi
     done
@@ -130,6 +160,7 @@ phase_setup() {
         die "jq 가 필요합니다 — 먼저 './install.sh deps' 를 실행하세요"
     fi
     jq -n '[1] | walk(.)' >/dev/null 2>&1 || die "jq 1.6 이상이 필요합니다 (현재: $(jq --version 2>&1))"
+    load_secrets
     [ -n "${CATALOG:-}" ] || build_catalog
     collect_mcp_vars
     register_mcp_servers
@@ -144,6 +175,7 @@ cmd_doctor() {
         if have "$c"; then v=$("$c" --version 2>/dev/null | head -1) || true; ok "$c — $v"; else warn "$c 없음"; fi
     done
     build_catalog
+    load_secrets
     local name missing
     for name in $MCP_SERVERS; do
         missing=$(mcp_missing_vars "$name")

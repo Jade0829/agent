@@ -80,18 +80,18 @@ install_clis() {
     step "에이전트 CLI"
     if has_tool claude; then
         if have claude; then ok "claude $(claude --version 2>/dev/null | head -1)"
-        else info "Claude Code 설치"; npm_global @anthropic-ai/claude-code; fi
+        else info "Claude Code 설치"; npm_global "@anthropic-ai/claude-code${CLAUDE_CODE_VERSION:+@$CLAUDE_CODE_VERSION}"; fi
     fi
     if has_tool codex; then
         if have codex; then ok "codex $(codex --version 2>/dev/null | head -1)"
-        else info "Codex CLI 설치"; npm_global @openai/codex; fi
+        else info "Codex CLI 설치"; npm_global "@openai/codex${CODEX_VERSION:+@$CODEX_VERSION}"; fi
     fi
 }
 
 install_mcp_servers() {
     step "MCP 서버 설치"
     [ -n "${MCP_SERVERS// /}" ] || { info "선택된 MCP 없음"; return; }
-    local name type pkg repo build dir scope registry
+    local name type pkg repo build dir scope registry ref
     for name in $MCP_SERVERS; do
         type=$(jq -r --arg n "$name" '.[$n].install.type // "none"' "$CATALOG")
         case $type in
@@ -112,8 +112,25 @@ install_mcp_servers() {
             git)
                 repo=$(jq -r --arg n "$name" '.[$n].install.repo' "$CATALOG")
                 build=$(jq -r --arg n "$name" '.[$n].install.build // ""' "$CATALOG")
+                ref=$(jq -r --arg n "$name" '.[$n].install.ref // ""' "$CATALOG")
                 dir="$MCP_HOME/$name"
-                if [ -d "$dir/.git" ]; then run git -C "$dir" pull -q --ff-only || warn "$name: git pull 실패 (기존 버전 유지)"
+                if [ -n "$ref" ]; then
+                    # Pinned: a tag or commit from the catalog.
+                    if [ ! -d "$dir/.git" ]; then
+                        run mkdir -p "$MCP_HOME"
+                        run git clone -q "$repo" "$dir" || { warn "$name: clone 실패"; continue; }
+                    elif [ "$(git -C "$dir" rev-parse --is-shallow-repository 2>/dev/null)" = true ]; then
+                        # An earlier unpinned install was a depth-1 clone; older refs need full history.
+                        run git -C "$dir" fetch -q --unshallow --tags origin || warn "$name: git fetch 실패"
+                    else run git -C "$dir" fetch -q --tags origin || warn "$name: git fetch 실패"; fi
+                    run git -C "$dir" checkout -q "$ref" || { warn "$name: ref '$ref' 체크아웃 실패"; continue; }
+                elif [ -d "$dir/.git" ]; then
+                    # Coming back from a pinned (detached) checkout: return to the default branch first.
+                    if ! git -C "$dir" symbolic-ref -q HEAD >/dev/null 2>&1; then
+                        run git -C "$dir" checkout -q "$(git -C "$dir" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')" ||
+                            warn "$name: 기본 브랜치로 돌아가지 못했습니다"
+                    fi
+                    run git -C "$dir" pull -q --ff-only || warn "$name: git pull 실패 (기존 버전 유지)"
                 else run mkdir -p "$MCP_HOME"; run git clone -q --depth 1 "$repo" "$dir" || { warn "$name: clone 실패"; continue; }; fi
                 if [ -n "$build" ]; then
                     if run sh -c 'cd "$1" && eval "$2"' _ "$dir" "$build" >/dev/null 2>&1; then ok "$name ($dir)"

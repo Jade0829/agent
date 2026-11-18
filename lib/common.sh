@@ -65,7 +65,9 @@ backup_once() {
     abs="$(cd "$(dirname "$f")" && pwd -P)/$(basename "$f")"
     dest="$BACKUP_DIR$abs"
     [ -e "$dest" ] && return 0
-    mkdir -p "$(dirname "$dest")"
+    # Backups can hold tokens (settings, .npmrc): the tree is owner-only.
+    ( umask 077; mkdir -p "$(dirname "$dest")" )
+    chmod 700 "$DATA_HOME/backups" "$BACKUP_DIR"
     cp -pL "$f" "$dest"
     BACKED_UP=1
 }
@@ -91,9 +93,10 @@ render() {
 upsert_block() {
     local file=$1 id=$2 src=$3 tmp nb=0 ne=0 lb=0 le=0
     local begin="<!-- agent-kit:begin $id -->" end="<!-- agent-kit:end $id -->"
+    [ -r "$src" ] || { warn "$file: 블록 내용 파일을 읽을 수 없어 건드리지 않았습니다"; return 1; }
     if [ -f "$file" ]; then
         read -r nb ne lb le < <(awk -v b="$begin" -v e="$end" '
-            { l = $0; sub(/\r$/, "", l) }
+            { l = $0; sub(/[[:space:]]+$/, "", l) }
             l == b { nb++; lb = NR }
             l == e { ne++; le = NR }
             END { print nb + 0, ne + 0, lb + 0, le + 0 }' "$file")
@@ -104,17 +107,42 @@ upsert_block() {
     fi
     tmp=$(mktemp)
     awk -v b="$begin" -v e="$end" -v src="$src" '
-        function emit(   x) { print b; while ((getline x < src) > 0) print x; close(src); print e }
-        { l = $0; sub(/\r$/, "", l) }
+        function emit(   x, r) {
+            print b
+            while ((r = (getline x < src)) > 0) print x
+            if (r < 0) { failed = 1; exit 2 }
+            close(src); print e
+        }
+        { l = $0; sub(/[[:space:]]+$/, "", l) }
         l == b { emit(); skip = 1; placed = 1; next }
         l == e && skip { skip = 0; next }
         !skip { print; n++; blank = (l ~ /^[[:space:]]*$/) }
-        END { if (!placed) { if (n && !blank) print ""; emit() } }' "$( [ -f "$file" ] && echo "$file" || echo /dev/null )" >"$tmp"
+        END { if (failed) exit 2; if (!placed) { if (n && !blank) print ""; emit() } }' \
+        "$( [ -f "$file" ] && echo "$file" || echo /dev/null )" >"$tmp" && [ -s "$tmp" ] || {
+        rm -f "$tmp"
+        warn "$file: 블록을 만들지 못해 건드리지 않았습니다"
+        return 1
+    }
     write_file "$file" "$tmp"
     rm -f "$tmp"
 }
 
+# secret_value RAW: the literal value of one KEY=RAW line. Nothing is evaluated:
+# quotes are stripped, $(...) and backticks stay plain text.
+secret_value() {
+    local v=$1
+    # Trailing blanks and a CR (CRLF file) are not part of the value.
+    v=${v%"${v##*[![:space:]]}"}
+    case $v in
+        \'*\') v=${v:1:${#v}-2}; v=${v//"'\\''"/"'"} ;;
+        \"*\") v=${v:1:${#v}-2}; v=$(printf '%s' "$v" | sed 's/\\\(["\\$`]\)/\1/g') ;;
+        *) v=$(printf '%s' "$v" | sed 's/\\\(.\)/\1/g') ;;
+    esac
+    printf '%s' "$v"
+}
+
 # save_var KEY VALUE: persist to the secrets file (mode 600) and export.
+# Written as export KEY='value' so the file can also be sourced by a shell.
 save_var() {
     local key=$1 value=$2 tmp
     export "$key=$value"
@@ -122,8 +150,8 @@ save_var() {
     mkdir -p "$CONFIG_HOME"
     ( umask 077
       tmp=$(mktemp "$CONFIG_HOME/.secrets.XXXXXX")
-      if [ -f "$SECRETS_FILE" ]; then grep -v "^export $key=" "$SECRETS_FILE" >"$tmp" || true; fi
-      printf 'export %s=%q\n' "$key" "$value" >>"$tmp"
+      if [ -f "$SECRETS_FILE" ]; then grep -vE "^(export )?$key=" "$SECRETS_FILE" >"$tmp" || true; fi
+      printf "export %s='%s'\n" "$key" "${value//"'"/"'\\''"}" >>"$tmp"
       mv "$tmp" "$SECRETS_FILE" )
     chmod 600 "$SECRETS_FILE"
 }
@@ -146,17 +174,28 @@ load_profile() {
     # shellcheck disable=SC1091
     [ -f "$CONFIG_HOME/profile.env" ] && . "$CONFIG_HOME/profile.env"
     for f in "$CONFIG_HOME"/mcp.d/*.json; do [ -f "$f" ] && PROFILE_MCP_FILES+=("$f"); done
-    # Explicit environment wins over stored values.
+    export AGENT_LANG RESEARCH_DIR REVIEW_TAG_MUST REVIEW_TAG_SHOULD
+}
+
+# load_secrets: stored MCP values into the environment. Called only by the
+# steps that need them, so phase 1 (package, npm and build scripts) runs
+# without the stored tokens. Explicit environment wins over stored values;
+# within the file the last line for a key wins. Lines are parsed, never
+# evaluated.
+load_secrets() {
     if [ -f "$SECRETS_FILE" ]; then
-        local line key
+        local line key from_file=' '
         while IFS= read -r line; do
             line=${line#export }
             key=${line%%=*}
-            [ -n "${!key:-}" ] && continue
-            eval "export $line" 2>/dev/null || warn "$SECRETS_FILE: '$key' 줄을 읽지 못했습니다 (KEY='값' 한 줄 형식)"
+            case $from_file in
+                *" $key "*) ;;
+                *) [ -n "${!key:-}" ] && continue ;;
+            esac
+            export "$key=$(secret_value "${line#*=}")"
+            from_file="$from_file$key "
         done < <(grep -E '^(export )?[A-Za-z_][A-Za-z0-9_]*=' "$SECRETS_FILE")
     fi
-    export AGENT_LANG RESEARCH_DIR REVIEW_TAG_MUST REVIEW_TAG_SHOULD
 }
 
 # Merged MCP catalog (later files override earlier ones). Needs jq.
