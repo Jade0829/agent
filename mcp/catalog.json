@@ -1,0 +1,47 @@
+{
+  "gitlab": {
+    "install": { "type": "npx", "package": "@zereight/mcp-gitlab" },
+    "command": "npx",
+    "args": ["-y", "@zereight/mcp-gitlab"],
+    "env": {
+      "GITLAB_API_URL": "${GITLAB_API_URL}",
+      "GITLAB_PERSONAL_ACCESS_TOKEN": "${GITLAB_TOKEN}"
+    },
+    "vars": {
+      "GITLAB_API_URL": { "prompt": "GitLab API URL", "default": "https://gitlab.com/api/v4" },
+      "GITLAB_TOKEN": { "prompt": "GitLab personal access token", "secret": true }
+    }
+  },
+  "redmine": {
+    "install": { "type": "npx", "package": "@chspower1/mcp-for-redmine" },
+    "command": "npx",
+    "args": ["-y", "@chspower1/mcp-for-redmine"],
+    "env": {
+      "REDMINE_BASE_URL": "${REDMINE_BASE_URL}",
+      "REDMINE_API_KEY": "${REDMINE_API_KEY}"
+    },
+    "vars": {
+      "REDMINE_BASE_URL": { "prompt": "Redmine URL (예: https://redmine.example.com)" },
+      "REDMINE_API_KEY": { "prompt": "Redmine API key", "secret": true }
+    }
+  },
+  "jenkins": {
+    "install": {
+      "type": "git",
+      "repo": "https://github.com/hekmon8/jenkins-server-mcp.git",
+      "build": "npm install --no-fund --no-audit && npm run build"
+    },
+    "command": "node",
+    "args": ["${MCP_HOME}/jenkins/build/index.js"],
+    "env": {
+      "JENKINS_URL": "${JENKINS_BASE_URL}",
+      "JENKINS_USER": "${JENKINS_USER}",
+      "JENKINS_TOKEN": "${JENKINS_TOKEN}"
+    },
+    "vars": {
+      "JENKINS_BASE_URL": { "prompt": "Jenkins URL (예: https://jenkins.example.com)" },
+      "JENKINS_USER": { "prompt": "Jenkins user" },
+      "JENKINS_TOKEN": { "prompt": "Jenkins API token", "secret": true }
+    }
+  }
+}

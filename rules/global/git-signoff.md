@@ -1,0 +1,1 @@
+- Sign off every commit: `git commit -s`.
