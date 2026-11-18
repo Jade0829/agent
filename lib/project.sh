@@ -86,6 +86,11 @@ cmd_project() {
         local s d
         for s in "$KIT_ROOT"/scripts/jenkins/*.sh; do
             d="$PROJECT_DIR/agents/jenkins/scripts/$(basename "$s")"
+            # A project keeps its own copy; say so when it no longer matches the kit's.
+            if [ -e "$d" ] && [ "$(cksum <"$s")" != "$(cksum <"$d")" ]; then
+                warn "agents/jenkins/scripts/$(basename "$s") 가 킷 버전과 다릅니다 — 새 버전을 쓰려면 그 파일을 지우고 다시 실행하세요"
+                continue
+            fi
             create_if_missing "$d" "$s"
             [ "$DRY_RUN" -eq 1 ] || chmod +x "$d"
         done

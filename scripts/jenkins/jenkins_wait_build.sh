@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# Wait for Jenkins builds to finish.
+#   <job> <build> [initial-wait] [interval] [timeout]   wait for one build
+#   (no arguments)                                       wait for every registered build
+# A job inside folders is written as folder/sub/job.
+# Exit code: 0 every build ended SUCCESS, 1 a build ended otherwise,
+#            124 timeout (also when the status could not be read until the
+#            timeout: wrong job name, Jenkins unreachable), 64 usage error.
 set -euo pipefail
 
 if [[ $# -eq 1 || $# -gt 5 ]]; then
@@ -18,7 +25,25 @@ if [[ -z ${JENKINS_USER} || -z ${JENKINS_TOKEN} ]]; then
     exit 64
 fi
 
-auth=("${JENKINS_USER}:${JENKINS_TOKEN}")
+if [[ ${JENKINS_USER}${JENKINS_TOKEN} == *[$'\n\r']* ]]; then
+    echo "JENKINS_USER / JENKINS_TOKEN must not contain line breaks" >&2
+    exit 64
+fi
+
+# curl with the credentials passed on stdin (-K -), so the token never shows
+# up in the process list.
+curl_auth() {
+    local u=${JENKINS_USER//\\/\\\\} t=${JENKINS_TOKEN//\\/\\\\}
+    printf 'user = "%s:%s"\n' "${u//\"/\\\"}" "${t//\"/\\\"}" | curl -K - "$@"
+}
+
+# job_path NAME: folder/sub/job -> /job/folder/job/sub/job/job, each part URL-encoded.
+job_path() {
+    "${PYTHON_BIN}" -c '
+import os, sys, urllib.parse
+print("".join("/job/" + urllib.parse.quote(os.fsencode(p), safe="") for p in sys.argv[1].split("/") if p))
+' "$1"
+}
 
 sanitize_state_name() {
     printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'
@@ -52,7 +77,7 @@ fetch_url() {
     local attempt
 
     for attempt in 1 2 3; do
-        if curl -sS -L --fail --connect-timeout 10 --max-time 30 -u "${auth[0]}" "${url}"; then
+        if curl_auth -sS -L --fail --connect-timeout 10 --max-time 30 "${url}"; then
             return 0
         fi
         echo "curl failed for ${url} (attempt ${attempt}/3)" >&2
@@ -72,7 +97,8 @@ state_value() {
 build_status() {
     local job_name=$1
     local build_number=$2
-    local build_api="${JENKINS_BASE_URL}/job/${job_name}/${build_number}/api/json"
+    local build_api
+    build_api="${JENKINS_BASE_URL}$(job_path "${job_name}")/${build_number}/api/json"
 
     fetch_url "${build_api}" | "${PYTHON_BIN}" -c '
 import json, sys
@@ -85,7 +111,8 @@ print("true" if data.get("building") else "false")
 workflow_node() {
     local job_name=$1
     local build_number=$2
-    local console_url="${JENKINS_BASE_URL}/job/${job_name}/${build_number}/consoleText"
+    local console_url
+    console_url="${JENKINS_BASE_URL}$(job_path "${job_name}")/${build_number}/consoleText"
 
     fetch_url "${console_url}" |
         grep -oE 'Running on [^ ]+' |
@@ -101,17 +128,34 @@ monitor_single_build() {
     local timeout=${5:-1800}
     local start_epoch
     local slept_initial_wait=false
+    local v
 
     if [[ -z ${job_name} || -z ${build_number} ]]; then
         echo "JOB_NAME and BUILD_NUMBER are required" >&2
         exit 64
     fi
 
+    for v in "${initial_wait}" "${interval}" "${timeout}"; do
+        if [[ ! ${v} =~ ^[0-9]+$ ]]; then
+            echo "initial-wait, interval and timeout must be whole seconds: ${v}" >&2
+            exit 64
+        fi
+    done
+
     echo "monitor build ${job_name} #${build_number}"
     start_epoch=$(date +%s)
 
     while true; do
-        status=$(build_status "${job_name}" "${build_number}")
+        # An unreadable status is not a build result: keep trying until the timeout.
+        if ! status=$(build_status "${job_name}" "${build_number}" 2>/dev/null); then
+            echo "status fetch failed for ${job_name} #${build_number}; will retry" >&2
+            if (( $(date +%s) - start_epoch >= 10#${timeout} )); then
+                echo "timeout: status of ${job_name} #${build_number} never became readable" >&2
+                return 124
+            fi
+            sleep "${interval}"
+            continue
+        fi
         result=$(printf '%s\n' "${status}" | sed -n '1p')
         building=$(printf '%s\n' "${status}" | sed -n '2p')
         echo "$(date '+%F %T') ${job_name} #${build_number} result=${result} building=${building}"
@@ -120,10 +164,14 @@ monitor_single_build() {
             node=$(workflow_node "${job_name}" "${build_number}" || true)
             echo "BUILD_RESULT=${result}"
             echo "WORKFLOW_NODE=${node:-unknown}"
-            return 0
+            # This build is done: take it out of the pending queue.
+            state_file="${STATE_DIR}/$(sanitize_state_name "${job_name}-${build_number}").state"
+            [[ -f ${state_file} ]] && mv "${state_file}" "${state_file%.state}.done"
+            [[ ${result} == "SUCCESS" ]] && return 0
+            return 1
         fi
 
-        if (( $(date +%s) - start_epoch >= timeout )); then
+        if (( $(date +%s) - start_epoch >= 10#${timeout} )); then
             echo "timeout waiting for ${job_name} #${build_number}" >&2
             return 124
         fi
@@ -142,7 +190,11 @@ monitor_single_build() {
 monitor_state_dir() {
     local interval=60
     local timeout=1800
+    local initial_wait=''
     local start_epoch
+    local failed=0
+    local first_round=true
+    local v
 
     mkdir -p "${STATE_DIR}"
     rm -f "${STATE_DIR}"/*.done
@@ -154,7 +206,27 @@ monitor_state_dir() {
         exit 64
     fi
 
-    echo "monitor state directory ${STATE_DIR}"
+    # Timings recorded at registration: the shortest interval and initial wait,
+    # the longest timeout.
+    # A build registered without timings counts with the defaults (60s / 1800s),
+    # so one short-lived entry cannot cut the wait for the others.
+    local first=true
+    for state_file in "${state_files[@]}"; do
+        v=$(state_value "${state_file}" INTERVAL); [[ ${v} =~ ^[0-9]+$ ]] || v=60
+        v=$((10#${v}))
+        if [[ ${first} == true ]] || (( v < interval )); then interval=${v}; fi
+        v=$(state_value "${state_file}" TIMEOUT); [[ ${v} =~ ^[0-9]+$ ]] || v=1800
+        v=$((10#${v}))
+        if [[ ${first} == true ]] || (( v > timeout )); then timeout=${v}; fi
+        v=$(state_value "${state_file}" INITIAL_WAIT)
+        if [[ ${v} =~ ^[0-9]+$ ]]; then
+            v=$((10#${v}))
+            if [[ -z ${initial_wait} ]] || (( v < initial_wait )); then initial_wait=${v}; fi
+        fi
+        first=false
+    done
+
+    echo "monitor state directory ${STATE_DIR} (interval=${interval}s timeout=${timeout}s)"
     start_epoch=$(date +%s)
 
     while true; do
@@ -162,7 +234,7 @@ monitor_state_dir() {
         state_files=("${STATE_DIR}"/*.state)
         if [[ ${#state_files[@]} -eq 0 ]]; then
             echo "all tracked builds completed"
-            return 0
+            return "${failed}"
         fi
 
         for state_file in "${state_files[@]}"; do
@@ -186,6 +258,7 @@ monitor_state_dir() {
                 node=$(workflow_node "${job_name}" "${build_number}" || true)
                 echo "BUILD_RESULT ${job_name} #${build_number}=${result}"
                 echo "WORKFLOW_NODE ${job_name} #${build_number}=${node:-unknown}"
+                [[ ${result} == "SUCCESS" ]] || failed=1
                 mv "${state_file}" "${state_file%.state}.done"
             else
                 remaining=1
@@ -194,7 +267,7 @@ monitor_state_dir() {
 
         if [[ ${remaining} -eq 0 ]]; then
             echo "all tracked builds completed"
-            return 0
+            return "${failed}"
         fi
 
         if (( $(date +%s) - start_epoch >= timeout )); then
@@ -202,8 +275,14 @@ monitor_state_dir() {
             return 124
         fi
 
-        echo "$(date '+%F %T') next check in ${interval}s"
-        sleep "${interval}"
+        if [[ ${first_round} == true && -n ${initial_wait} ]]; then
+            echo "$(date '+%F %T') next check in ${initial_wait}s"
+            sleep "${initial_wait}"
+        else
+            echo "$(date '+%F %T') next check in ${interval}s"
+            sleep "${interval}"
+        fi
+        first_round=false
     done
 }
 

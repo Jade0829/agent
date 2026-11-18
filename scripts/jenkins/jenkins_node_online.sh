@@ -18,7 +18,17 @@ if [[ -z ${JENKINS_USER} || -z ${JENKINS_TOKEN} ]]; then
     exit 64
 fi
 
-auth=("${JENKINS_USER}:${JENKINS_TOKEN}")
+if [[ ${JENKINS_USER}${JENKINS_TOKEN} == *[$'\n\r']* ]]; then
+    echo "JENKINS_USER / JENKINS_TOKEN must not contain line breaks" >&2
+    exit 64
+fi
+
+# curl with the credentials passed on stdin (-K -), so the token never shows
+# up in the process list.
+curl_auth() {
+    local u=${JENKINS_USER//\\/\\\\} t=${JENKINS_TOKEN//\\/\\\\}
+    printf 'user = "%s:%s"\n' "${u//\"/\\\"}" "${t//\"/\\\"}" | curl -K - "$@"
+}
 
 sanitize_state_name() {
     printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'
@@ -42,7 +52,7 @@ fetch_url() {
     local attempt
 
     for attempt in 1 2 3; do
-        if curl -sS -L --fail --connect-timeout 10 --max-time 30 -u "${auth[0]}" "${url}"; then
+        if curl_auth -sS -L --fail --connect-timeout 10 --max-time 30 "${url}"; then
             return 0
         fi
         echo "curl failed for ${url} (attempt ${attempt}/3)" >&2
@@ -52,26 +62,18 @@ fetch_url() {
     return 1
 }
 
+# One POST, no retry: toggleOffline is not idempotent, so the caller decides
+# whether to send again by re-reading the node status.
 post_url() {
     local url=$1
     local crumb_field=$2
     local crumb_value=$3
-    local attempt
 
-    for attempt in 1 2 3; do
-        if curl -sS -L --fail --connect-timeout 10 --max-time 30 \
-            -u "${auth[0]}" \
-            -H "${crumb_field}: ${crumb_value}" \
-            -X POST \
-            --data '' \
-            "${url}" >/dev/null; then
-            return 0
-        fi
-        echo "curl POST failed for ${url} (attempt ${attempt}/3)" >&2
-        sleep 5
-    done
-
-    return 1
+    curl_auth -sS -L --fail --connect-timeout 10 --max-time 30 \
+        -H "${crumb_field}: ${crumb_value}" \
+        -X POST \
+        --data '' \
+        "${url}" >/dev/null
 }
 
 state_value() {
@@ -113,31 +115,62 @@ bring_node_online() {
     local crumb
     local crumb_field
     local crumb_value
+    local attempt
 
     if [[ -z ${node_name} ]]; then
         echo "NODE_NAME is required" >&2
         return 64
     fi
 
-    status=$(node_status "${node_name}")
+    # toggleOffline flips the mark, so it is only sent when the node is known
+    # to be marked temporarily offline. An unreadable status is never a reason
+    # to toggle: that would take a healthy node offline.
+    if ! status=$(node_status "${node_name}"); then
+        echo "cannot read status of ${node_name}; not toggling" >&2
+        return 1
+    fi
     offline=$(printf '%s\n' "${status}" | sed -n '1p')
     temporarily_offline=$(printf '%s\n' "${status}" | sed -n '2p')
     reason=$(printf '%s\n' "${status}" | sed -n '3p')
-
-    if [[ ${offline} == "false" && ${temporarily_offline} == "false" ]]; then
-        echo "NODE_STATUS=${node_name} already_online"
-        return 0
+    if [[ ! ${offline} =~ ^(true|false)$ || ! ${temporarily_offline} =~ ^(true|false)$ ]]; then
+        echo "unexpected status for ${node_name}; not toggling" >&2
+        return 1
     fi
 
-    crumb=$(crumb_info)
+    if [[ ${temporarily_offline} == "false" ]]; then
+        if [[ ${offline} == "false" ]]; then
+            echo "NODE_STATUS=${node_name} already_online"
+            return 0
+        fi
+        # Offline without the mark: the agent is disconnected. Toggling would
+        # only add a temporary-offline mark on top of that.
+        echo "NODE_STATUS=${node_name} disconnected (agent not connected; nothing to toggle)" >&2
+        return 1
+    fi
+
+    if ! crumb=$(crumb_info); then
+        echo "cannot get a crumb; ${node_name} left as it is" >&2
+        return 1
+    fi
     crumb_field=$(printf '%s\n' "${crumb}" | sed -n '1p')
     crumb_value=$(printf '%s\n' "${crumb}" | sed -n '2p')
 
-    post_url "${JENKINS_BASE_URL}/computer/${node_name}/toggleOffline" "${crumb_field}" "${crumb_value}"
+    # The HTTP reply does not tell whether the toggle was applied (a lost or
+    # failed reply can follow an applied toggle), so the node status decides.
+    # Another toggle is sent only while the node is still marked offline.
+    for attempt in 1 2 3; do
+        post_url "${JENKINS_BASE_URL}/computer/${node_name}/toggleOffline" "${crumb_field}" "${crumb_value}" ||
+            echo "toggle request for ${node_name} reported an error (attempt ${attempt}/3); checking the node" >&2
 
-    status=$(node_status "${node_name}")
-    offline=$(printf '%s\n' "${status}" | sed -n '1p')
-    temporarily_offline=$(printf '%s\n' "${status}" | sed -n '2p')
+        if ! status=$(node_status "${node_name}"); then
+            echo "toggle sent, but the status of ${node_name} could not be re-read; not sending again" >&2
+            return 1
+        fi
+        offline=$(printf '%s\n' "${status}" | sed -n '1p')
+        temporarily_offline=$(printf '%s\n' "${status}" | sed -n '2p')
+        [[ ${temporarily_offline} == "true" ]] || break
+        [[ ${attempt} -lt 3 ]] && sleep 5
+    done
 
     if [[ ${offline} == "false" && ${temporarily_offline} == "false" ]]; then
         echo "NODE_STATUS=${node_name} online"
@@ -183,5 +216,9 @@ if [[ $# -eq 0 ]]; then
     bring_state_nodes_online
 else
     register_state_file "$1"
-    bring_node_online "$1"
+    bring_node_online "$1" || exit 1
+    # Done: take it out of the pending queue so a later run does not replay it.
+    state_file="${STATE_DIR}/$(sanitize_state_name "$1").state"
+    [[ -f ${state_file} ]] && mv "${state_file}" "${state_file%.state}.done"
+    exit 0
 fi

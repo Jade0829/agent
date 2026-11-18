@@ -18,6 +18,9 @@ Never echo the token or write it into a file in the repository.
    agents/jenkins/scripts/jenkins_wait_build_register.sh <job> <build>
    agents/jenkins/scripts/jenkins_wait_build.sh        # consumes every pending entry
    ```
+   Exit code 0 means every build ended `SUCCESS`; 1 means one did not; 124 is
+   a timeout, which includes "the status could never be read" (wrong job name,
+   Jenkins unreachable). A job inside folders is written `folder/job`.
 5. If a build took its node offline for inspection, bring that exact node back
    before the next run — unless the user reserved it:
    ```bash
